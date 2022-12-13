@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iot-controller
+spec:
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"  
+    spec:
+      containers:
+      - name: pi
+        image: grosinosky/iot-simulator
+        #command: ["perl",  "-Mbignum=bpi", "-wle", "print bpi(2000)"]
+        env:
+          - name: BROKER_ADDRESS
+            value: sitewhere-mosquitto.sitewhere-system
+          - name: BROKER_PORT
+            value: "1883"
+          - name: API_GATEWAY_ADDRESS
+            value: instance-management.sitewhere:8080
+          - name: DEBUG
+            value: "1"
+          - name: NB_WORKERS
+            value: "10"
+              
+      restartPolicy: Never
+  backoffLimit: 1
