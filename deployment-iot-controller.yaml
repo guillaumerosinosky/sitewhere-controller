@@ -1,12 +1,20 @@
-apiVersion: batch/v1
-kind: Job
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: iot-controller
+  labels:
+    app: sitewhere-controller  
 spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sitewhere-controller
   template:
     metadata:
       annotations:
         sidecar.istio.io/inject: "false"  
+      labels:
+        app: sitewhere-controller  
     spec:
       containers:
       - name: pi
@@ -23,6 +31,3 @@ spec:
             value: "1"
           - name: NB_WORKERS
             value: "10"
-              
-      restartPolicy: Never
-  backoffLimit: 1

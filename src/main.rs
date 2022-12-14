@@ -1,16 +1,13 @@
 use std::{env,fs};
-use std::io::{Error, ErrorKind};
-use mqtt::AsyncClient;
+use std::io::{Error, ErrorKind, Bytes};
 use reqwest::{header::HeaderMap, Response, Error as ReqwestError, get};
 use tracing::{info, error, warn, debug};
 use std::collections::HashMap;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime};
-use paho_mqtt as mqtt;
 use futures::{stream::StreamExt,};
-use paho_mqtt::{AsyncReceiver, Message, Token};
 use tokio::sync::mpsc;
-
+use rumqttc::{MqttOptions, AsyncClient, QoS, EventLoop, Event, Incoming, Packet, ConnectionError};
 #[derive(Debug)]
 //#[derive(Clone)]
 pub struct SitewhereHttpClient {
@@ -27,8 +24,7 @@ pub struct SitewhereHttpClient {
     map_devices: HashMap<String, (String, String)>,
 
     //mqtt_receiver: AsyncReceiver<Option<Message>>,
-    mqtt_receiver: mpsc::UnboundedReceiver<Option<(u128, Message)>>,
-    results: Vec<String>,
+    mqtt_receiver: mpsc::UnboundedReceiver<Option<(u128, Vec<u8>)>>,
     sender_results: mpsc::UnboundedSender<String>,
 }
 
@@ -138,11 +134,11 @@ impl SitewhereHttpClient {
                 continue
             }
             let (now, msg_opt) = msg_opt.unwrap();
-            let payload = msg_opt.payload();
+            let payload = msg_opt;
             if payload.eq(b"STOP") {
                 break   
             }            
-            let decoded_message: Value = serde_json::from_slice(payload).unwrap();
+            let decoded_message: Value = serde_json::from_slice(&payload).unwrap();
             debug!("Received message: {}", decoded_message);
             
 
@@ -212,47 +208,33 @@ impl SitewhereHttpClient {
 #[derive(Clone)]
 struct SitewhereMqttClient {
     broker_url: String,
+    broker_port: u16,
     topic: String,
     qos: i32,
     buffer_size: i32,
-    sender_mqtt: mpsc::UnboundedSender<Option<(u128, Message)>>,
+    sender_mqtt: mpsc::UnboundedSender<Option<(u128, Vec<u8>)>>,
 }
 
 impl SitewhereMqttClient {
-    async fn init(&mut self) -> Result<(AsyncClient, AsyncReceiver<Option<Message>>), mqtt::Error> {
+    async fn init(&mut self) -> Result<(rumqttc::AsyncClient, rumqttc::EventLoop), ConnectionError> {
         info!("Initializing MQTT client {:?}", self);
-        let create_opts = mqtt::CreateOptionsBuilder::new()
-            .server_uri(self.broker_url.clone())
-            .client_id("controller-consumer")
-            .max_buffered_messages(1000)
-            .finalize();
-        
-        let mut client = mqtt::AsyncClient::new(create_opts)?;
-        let mut msg_stream = client.get_stream(self.buffer_size as usize);
-        let conn_opts = mqtt::ConnectOptionsBuilder::new()
-            .keep_alive_interval(Duration::from_secs(30))
-            .mqtt_version(mqtt::MQTT_VERSION_3_1_1)
-            .clean_session(true)
+        let mut mqttoptions = MqttOptions::new("controller-consumer", self.broker_url.clone(), self.broker_port);
+        mqttoptions.set_keep_alive(Duration::from_secs(600));
 
-            //.will_message(lwt)
-            .finalize();
-        client.connect(conn_opts).await?;
-        //client.subscribe(self.topic.clone(), self.qos.clone()).await?;
-        /*
-         */
-
+        let (mut client, mut eventloop) = AsyncClient::new(mqttoptions, 10000);
         
-        Ok((client.clone(), msg_stream.clone()))
+        Ok((client.clone(), eventloop))
     }
 
-    async fn loop_message(&mut self, client:AsyncClient, mut msg_stream:AsyncReceiver<Option<Message>>) -> Result<(()), mqtt::Error> {
-        client.subscribe(self.topic.clone(), self.qos.clone()).await?;
+    async fn loop_message(&mut self, client:AsyncClient, mut msg_stream:EventLoop) -> Result<(()), ConnectionError> {
+        client.subscribe(self.topic.clone(), QoS::AtMostOnce).await.unwrap();
         info!("mqtt subscribed");
         
         let sender = self.sender_mqtt.clone();
         tokio::spawn(async move{
             
-            while let Some(message) = msg_stream.next().await{
+            while let Ok(event) = msg_stream.poll().await{
+                /*
                 if !client.is_connected() {
                     warn!("Client is not connected, attempting reconnect");
                     match client.reconnect().await {
@@ -262,13 +244,16 @@ impl SitewhereMqttClient {
                             error!("Failed to reconnect: {:?}", error)
                         },
                     }
-                }
-                if message.is_some() {
-                    let msg = Some((get_now_us(), message.unwrap()));
-                    sender.send(msg);
-                } else {
-                    sender.send(None);
-                }
+                } */
+                match event {
+                    Event::Incoming(Packet::Publish(msg)) => {
+                        let msg = Some((get_now_us(), msg.payload.to_vec()));
+                        sender.send(msg);
+                    },
+                    event => {
+                        debug!("Received {:?}", event);
+                    }
+                };
                 
                 //tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -298,8 +283,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_gateway_address = env::var("API_GATEWAY_ADDRESS").unwrap_or("20.74.29.222".to_string());
     let api_gateway_url = format!("http://{}/sitewhere/", api_gateway_address);
     let broker_address = env::var("BROKER_ADDRESS").unwrap_or("20.74.30.89".to_string());
-    let broker_port = env::var("BROKER_PORT").unwrap_or("1883".to_string());
-    let broker_url = format!("tcp://{}:{}", broker_address, broker_port);
+    let broker_port: u16 = env::var("BROKER_PORT").unwrap_or("1883".to_string()).parse().unwrap_or(1883);
+    //let broker_url = format!("tcp://{}:{}", broker_address, broker_port);
     
     info!("Launching Sitewhere controller...");
 
@@ -307,7 +292,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (sender_mqtt, mut receiver_mqtt) =  mpsc::unbounded_channel();
 
     let mut sitewhere_mqtt_client = SitewhereMqttClient {
-        broker_url: broker_url,
+        broker_url: broker_address,
+        broker_port: broker_port,
         topic: "SiteWhere/default/output/mqtt1".to_string(),
         qos: 1,
         buffer_size: 10000,
@@ -329,14 +315,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         map_device_types: HashMap::new(),
         map_devices: HashMap::new(),
         mqtt_receiver: receiver_mqtt,
-        results: Vec::new(),
         sender_results: sender_results.clone(),
     };
 
     sitewhere_http_client.init(client.clone()).await?;
 
     let mqtt_worker = async move {
-        match sitewhere_mqtt_client.loop_message(mqtt_client, mqtt_receiver.clone()).await {
+        match sitewhere_mqtt_client.loop_message(mqtt_client, mqtt_receiver).await {
             Ok(v) => {
                 info!("mqtt worker finished");
                 Ok(v)

@@ -1,3 +1,0 @@
-[submodule "paho.mqtt.rust"]
-	path = paho.mqtt.rust
-	url = https://github.com/eclipse/paho.mqtt.rust.git

@@ -3,7 +3,6 @@ WORKDIR /usr/src/myapp
 RUN apt update
 RUN apt install -y mosquitto-clients cmake
 COPY src src
-COPY paho.mqtt.rust paho.mqtt.rust
 COPY Cargo.toml .
 #RUN cargo build . --release
 RUN cargo install --path .
