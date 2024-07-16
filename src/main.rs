@@ -8,6 +8,12 @@ use std::time::{Duration, SystemTime};
 use futures::{stream::StreamExt,};
 use tokio::sync::mpsc;
 use rumqttc::{MqttOptions, AsyncClient, QoS, EventLoop, Event, Incoming, Packet, ConnectionError};
+
+use s3::error::S3Error;
+use s3::{Bucket};
+use s3::creds::Credentials;
+use s3::Region;
+
 #[derive(Debug)]
 //#[derive(Clone)]
 pub struct SitewhereHttpClient {
@@ -89,11 +95,14 @@ impl SitewhereHttpClient {
         info!("Init SitewhereHttpClient");
         self.login(client.clone()).await?;
 
-        self.devices = Some(self.query(client.clone(), "api/devices").await?["results"].clone());
-        self.device_types = Some(self.query(client.clone(), "api/devicetypes").await?["results"].clone());
-        //println!("{:#?}", self.device_types);
-        self.commands = Some(self.query(client.clone(), "api/commands").await?["results"].clone());
-        self.assignments = Some(self.query(client.clone(), "api/assignments").await?["results"].clone());
+        self.devices = Some(self.query(client.clone(), "api/devices?pageSize=1000").await?["results"].clone());
+        info!("Loaded {:?} devices", self.devices.as_ref().unwrap().as_array().unwrap().len());
+        self.device_types = Some(self.query(client.clone(), "api/devicetypes?pageSize=1000").await?["results"].clone());
+        info!("Loaded {} device types", self.device_types.as_ref().unwrap().as_array().unwrap().len());
+        self.commands = Some(self.query(client.clone(), "api/commands?pageSize=1000").await?["results"].clone());
+        info!("Loaded {} commands", self.commands.as_ref().unwrap().as_array().unwrap().len());
+        self.assignments = Some(self.query(client.clone(), "api/assignments?pageSize=1000").await?["results"].clone());
+        info!("Loaded {} assignments", self.assignments.as_ref().unwrap().as_array().unwrap().len());
 
         if let Some(elements) = self.device_types.as_ref().unwrap().as_array() {
             for element in elements {
@@ -233,7 +242,7 @@ impl SitewhereMqttClient {
         let sender = self.sender_mqtt.clone();
         tokio::spawn(async move{
             
-            while let Ok(event) = msg_stream.poll().await{
+            while let event = msg_stream.poll().await{
                 /*
                 if !client.is_connected() {
                     warn!("Client is not connected, attempting reconnect");
@@ -246,10 +255,14 @@ impl SitewhereMqttClient {
                     }
                 } */
                 match event {
-                    Event::Incoming(Packet::Publish(msg)) => {
+                    Ok(Event::Incoming(Packet::Publish(msg))) => {
                         let msg = Some((get_now_us(), msg.payload.to_vec()));
                         sender.send(msg);
                     },
+                    Err(e) => {
+                        error!("error: {:?}", e);
+                        break
+                    }
                     event => {
                         debug!("Received {:?}", event);
                     }
@@ -282,10 +295,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let api_gateway_address = env::var("API_GATEWAY_ADDRESS").unwrap_or("20.74.29.222".to_string());
     let api_gateway_url = format!("http://{}/sitewhere/", api_gateway_address);
-    let broker_address = env::var("BROKER_ADDRESS").unwrap_or("20.74.30.89".to_string());
+    let broker_address = env::var("BROKER_ADDRESS").unwrap_or("20.74.25.142".to_string());
     let broker_port: u16 = env::var("BROKER_PORT").unwrap_or("1883".to_string()).parse().unwrap_or(1883);
     //let broker_url = format!("tcp://{}:{}", broker_address, broker_port);
     
+    let minio_address = env::var("MINIO_ADDRESS").unwrap_or("http://20.19.22.71:9000".into());
+    let minio_access_key = env::var("MINIO_ACCESS_KEY").unwrap_or("admin".into());
+    let minio_secret_key = env::var("MINIO_SECRET_KEY").unwrap_or("6L320jOQwm".into());
+    let minio_bucket_name = env::var("MINIO_BUCKET").unwrap_or("results".into());
+    let xp_name = env::var("XP_NAME").unwrap_or("test".into());
+    let topic = env::var("TOPIC").unwrap_or("SiteWhere/default/output/mqtt1".into());
+
+    info!("Checking Minio availability");
+    let bucket = Bucket::new(
+        &minio_bucket_name,
+        Region::Custom {
+            region: "".to_owned(),
+            endpoint: minio_address,
+        },
+        Credentials::new(
+            Some(&minio_access_key),
+            Some(&minio_secret_key),
+            None,
+            None,
+            None
+        )?
+    )?
+    .with_path_style();
+
+    let test = bucket.list("/".to_string(), None).await?;
+    info!("Results: {:?}", test);
     info!("Launching Sitewhere controller...");
 
     let (sender_results, mut receiver_results) =  mpsc::unbounded_channel::<String>();
@@ -294,7 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sitewhere_mqtt_client = SitewhereMqttClient {
         broker_url: broker_address,
         broker_port: broker_port,
-        topic: "SiteWhere/default/output/mqtt1".to_string(),
+        topic: topic.to_string(),
         qos: 1,
         buffer_size: 10000,
         sender_mqtt: sender_mqtt,
@@ -357,9 +396,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             results.push(result);
         }
-        fs::write("./results.csv", results.join("\n")).expect("Unable to write file");
+        fs::write("./results.csv", results.clone().join("\n")).expect("Unable to write file");
 
-        info!("Written {} results...", results.len());
+        match bucket.put_object(format!("{}/{}", xp_name, "controller.csv"), results.join("\n").as_bytes()).await {
+            Ok(_v) => {
+                info!("Written {} results on {}", results.len(), xp_name + "/controller.csv");
+            }
+            Err(e) => {
+                panic!("Error while writing results on Minio: {}", e);
+            }
+        };
+
         Ok({})
     };
 
